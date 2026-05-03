@@ -43,7 +43,14 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 PORT         = int(os.environ.get("PORT", "8000"))
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# Lazy init — connect on first request not on startup
+_supabase_client: Optional[Client] = None
+
+def get_db() -> Client:
+    global _supabase_client
+    if _supabase_client is None:
+        _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return _supabase_client
 
 # Creator earnings rate — 1% of shards spent
 CREATOR_RATE = 0.01
@@ -161,13 +168,13 @@ async def upload_character(char: CharacterUpload):
         "total_chats":              0,
     }
 
-    result = supabase.table("characters").insert(char_data).execute()
+    result = get_db().table("characters").insert(char_data).execute()
 
     if not result.data:
         raise HTTPException(status_code=500, detail="Failed to save character.")
 
     # Add to moderation queue
-    supabase.table("moderation_queue").insert({
+    get_db().table("moderation_queue").insert({
         "character_id": char.id,
         "status": "pending"
     }).execute()
@@ -186,7 +193,7 @@ async def discover_characters(
 
     order_col = "created_at" if sort == "newest" else "likes"
 
-    result = supabase.table("characters") \
+    result = get_db().table("characters") \
         .select("id, name, creator_id, setting, art_url, art_style, gender, age, worldview, archetype, tags, likes, total_chats, created_at") \
         .eq("is_public", True) \
         .eq("approved", True) \
@@ -208,7 +215,7 @@ async def search_characters(
 ):
     """Search public characters by name, setting, or art style."""
 
-    query = supabase.table("characters") \
+    query = get_db().table("characters") \
         .select("id, name, creator_id, setting, art_url, art_style, gender, age, worldview, archetype, tags, likes, total_chats") \
         .eq("is_public", True) \
         .eq("approved", True) \
@@ -231,7 +238,7 @@ async def search_characters(
 async def get_character(character_id: str):
     """Get a single approved public character by ID."""
 
-    result = supabase.table("characters") \
+    result = get_db().table("characters") \
         .select("*") \
         .eq("id", character_id) \
         .eq("is_public", True) \
@@ -250,7 +257,7 @@ async def get_character(character_id: str):
 async def like_character(req: LikeRequest):
     """Increment like count on a character."""
 
-    supabase.rpc("increment_likes", {"char_id": req.character_id}).execute()
+    get_db().rpc("increment_likes", {"char_id": req.character_id}).execute()
     return {"success": True}
 
 # ── CHAT COUNT + CREATOR EARNINGS ─────────────────────────────────────────────
@@ -263,7 +270,7 @@ async def record_chat(req: ChatCountRequest):
     """
 
     # Increment chat count
-    supabase.rpc("increment_chats", {"char_id": req.character_id}).execute()
+    get_db().rpc("increment_chats", {"char_id": req.character_id}).execute()
 
     # Calculate creator earnings
     # 1% of shards spent, or 1% of "1 shard equivalent" per chat
@@ -271,7 +278,7 @@ async def record_chat(req: ChatCountRequest):
     earnings_fraction = shard_equivalent * CREATOR_RATE
 
     # Upsert creator earnings
-    existing = supabase.table("creator_earnings") \
+    existing = get_db().table("creator_earnings") \
         .select("pending_fraction, total_shards_earned") \
         .eq("creator_id", req.creator_id) \
         .execute()
@@ -282,7 +289,7 @@ async def record_chat(req: ChatCountRequest):
         new_fraction = current_fraction - whole_shards
         new_total = existing.data[0]["total_shards_earned"] + whole_shards
 
-        supabase.table("creator_earnings").update({
+        get_db().table("creator_earnings").update({
             "pending_fraction":    new_fraction,
             "total_shards_earned": new_total,
             "updated_at":          datetime.utcnow().isoformat()
@@ -290,7 +297,7 @@ async def record_chat(req: ChatCountRequest):
 
     else:
         whole_shards = int(earnings_fraction)
-        supabase.table("creator_earnings").insert({
+        get_db().table("creator_earnings").insert({
             "creator_id":          req.creator_id,
             "pending_fraction":    earnings_fraction - whole_shards,
             "total_shards_earned": whole_shards,
@@ -304,7 +311,7 @@ async def record_chat(req: ChatCountRequest):
 async def get_creator_earnings(creator_id: str):
     """Get creator shard earnings."""
 
-    result = supabase.table("creator_earnings") \
+    result = get_db().table("creator_earnings") \
         .select("*") \
         .eq("creator_id", creator_id) \
         .execute()
@@ -367,13 +374,13 @@ async def generate_image(req: ImageGenRequest):
 
                 # Upload to Supabase Storage
                 file_path = f"{req.creator_id}/{req.character_id}.png"
-                supabase.storage.from_("character-art").upload(
+                get_db().storage.from_("character-art").upload(
                     file_path,
                     image_bytes,
                     {"content-type": "image/png"}
                 )
 
-                public_url = supabase.storage.from_("character-art").get_public_url(file_path)
+                public_url = get_db().storage.from_("character-art").get_public_url(file_path)
 
                 return {"success": True, "art_url": public_url}
 
@@ -401,7 +408,7 @@ async def sync_user(user: UserSync):
         "free_week_end":  user.free_week_end,
     }
 
-    supabase.table("users").upsert(user_data).execute()
+    get_db().table("users").upsert(user_data).execute()
     return {"success": True}
 
 # ── MODERATION ────────────────────────────────────────────────────────────────
@@ -419,16 +426,16 @@ async def moderate_content(req: ModerationRequest):
     # If this is for a queued character, update its status
     if req.character_id:
         if result:
-            supabase.table("moderation_queue").update({
+            get_db().table("moderation_queue").update({
                 "status":      "approved",
                 "reviewed_at": datetime.utcnow().isoformat()
             }).eq("character_id", req.character_id).execute()
 
-            supabase.table("characters").update({
+            get_db().table("characters").update({
                 "approved": True
             }).eq("id", req.character_id).execute()
         else:
-            supabase.table("moderation_queue").update({
+            get_db().table("moderation_queue").update({
                 "status":           "rejected",
                 "reviewed_at":      datetime.utcnow().isoformat(),
                 "rejection_reason": "Content policy violation"
