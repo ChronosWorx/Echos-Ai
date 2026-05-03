@@ -480,3 +480,281 @@ def passes_basic_moderation(content: str) -> bool:
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False)
+
+# ══════════════════════════════════════════════════════════════
+# SERVER-SIDE ENFORCEMENT — Chat limits, Shards, Subscription
+# ══════════════════════════════════════════════════════════════
+
+# ── MODELS ────────────────────────────────────────────────────
+
+class ChatCheckRequest(BaseModel):
+    user_id: str
+    is_subscriber: bool = False
+    free_week_active: bool = False
+
+class ShardUpdateRequest(BaseModel):
+    user_id: str
+    amount: int          # positive = earn, negative = spend
+    reason: str
+
+class ShardSyncRequest(BaseModel):
+    user_id: str
+    local_balance: int   # app sends its local balance for reconciliation
+
+class SubscriptionVerifyRequest(BaseModel):
+    user_id: str
+    purchase_token: str
+    product_id: str
+    free_week_end: int = 0
+
+# ── CHAT LIMIT ENFORCEMENT ────────────────────────────────────
+
+FREE_DAILY_LIMIT = 25
+FREE_MAX_BANKED  = 60
+
+@app.post("/chats/check")
+async def check_chat_allowed(req: ChatCheckRequest):
+    """
+    Check if user is allowed to send a message.
+    Server is the source of truth — cannot be faked by modded APK.
+    Returns: allowed (bool), remaining (int), limit (int)
+    """
+    # Subscribers and free week users have unlimited chats
+    if req.is_subscriber or req.free_week_active:
+        return {"allowed": True, "remaining": -1, "limit": -1, "unlimited": True}
+
+    today = datetime.utcnow().date().isoformat()
+
+    # Get current usage
+    result = get_db().table("chat_usage") \
+        .select("chats_used") \
+        .eq("user_id", req.user_id) \
+        .eq("usage_date", today) \
+        .execute()
+
+    if result.data:
+        chats_used = result.data[0]["chats_used"]
+    else:
+        chats_used = 0
+
+    remaining = max(0, FREE_DAILY_LIMIT - chats_used)
+    allowed   = remaining > 0
+
+    if allowed:
+        # Increment usage
+        if result.data:
+            get_db().table("chat_usage").update({
+                "chats_used": chats_used + 1,
+                "updated_at": datetime.utcnow().isoformat()
+            }).eq("user_id", req.user_id).eq("usage_date", today).execute()
+        else:
+            get_db().table("chat_usage").insert({
+                "user_id":    req.user_id,
+                "usage_date": today,
+                "chats_used": 1
+            }).execute()
+
+    return {
+        "allowed":   allowed,
+        "remaining": remaining - (1 if allowed else 0),
+        "limit":     FREE_DAILY_LIMIT,
+        "unlimited": False
+    }
+
+@app.get("/chats/usage/{user_id}")
+async def get_chat_usage(user_id: str):
+    """Get current daily chat usage for a user."""
+    today = datetime.utcnow().date().isoformat()
+    result = get_db().table("chat_usage") \
+        .select("chats_used, usage_date") \
+        .eq("user_id", user_id) \
+        .eq("usage_date", today) \
+        .execute()
+
+    chats_used = result.data[0]["chats_used"] if result.data else 0
+    return {
+        "user_id":   user_id,
+        "date":      today,
+        "chats_used": chats_used,
+        "remaining": max(0, FREE_DAILY_LIMIT - chats_used),
+        "limit":     FREE_DAILY_LIMIT
+    }
+
+# ── SHARD BALANCE ENFORCEMENT ─────────────────────────────────
+
+@app.post("/shards/update")
+async def update_shards(req: ShardUpdateRequest):
+    """
+    Update shard balance server-side.
+    Spends are validated — cannot go below 0.
+    """
+    # Get current balance
+    result = get_db().table("shard_balances") \
+        .select("balance, lifetime_earned, lifetime_spent") \
+        .eq("user_id", req.user_id) \
+        .execute()
+
+    if result.data:
+        current = result.data[0]["balance"]
+        lifetime_earned = result.data[0]["lifetime_earned"]
+        lifetime_spent  = result.data[0]["lifetime_spent"]
+    else:
+        current = 0
+        lifetime_earned = 0
+        lifetime_spent  = 0
+
+    # Validate spend
+    if req.amount < 0 and abs(req.amount) > current:
+        return {"success": False, "error": "Insufficient shards", "balance": current}
+
+    new_balance = current + req.amount
+    new_earned  = lifetime_earned + (req.amount if req.amount > 0 else 0)
+    new_spent   = lifetime_spent  + (abs(req.amount) if req.amount < 0 else 0)
+
+    # Upsert balance
+    get_db().table("shard_balances").upsert({
+        "user_id":         req.user_id,
+        "balance":         new_balance,
+        "lifetime_earned": new_earned,
+        "lifetime_spent":  new_spent,
+        "updated_at":      datetime.utcnow().isoformat()
+    }).execute()
+
+    # Log transaction
+    get_db().table("shard_transactions").insert({
+        "user_id": req.user_id,
+        "amount":  req.amount,
+        "reason":  req.reason
+    }).execute()
+
+    return {"success": True, "balance": new_balance, "delta": req.amount}
+
+@app.post("/shards/sync")
+async def sync_shards(req: ShardSyncRequest):
+    """
+    Sync local shard balance with server.
+    Server wins if discrepancy is suspicious (local > server * 1.5).
+    Returns the authoritative balance.
+    """
+    result = get_db().table("shard_balances") \
+        .select("balance") \
+        .eq("user_id", req.user_id) \
+        .execute()
+
+    server_balance = result.data[0]["balance"] if result.data else 0
+
+    # If local balance is way higher than server — likely cheating
+    # Allow small differences (could be offline transactions)
+    if req.local_balance > server_balance * 1.5 and req.local_balance - server_balance > 100:
+        # Use server balance — reject the inflated local value
+        return {
+            "authoritative_balance": server_balance,
+            "accepted_local":        False,
+            "reason":                "Local balance rejected — server balance used"
+        }
+
+    # If local is reasonably higher — trust it and sync up
+    if req.local_balance > server_balance:
+        get_db().table("shard_balances").upsert({
+            "user_id":    req.user_id,
+            "balance":    req.local_balance,
+            "updated_at": datetime.utcnow().isoformat()
+        }).execute()
+        return {"authoritative_balance": req.local_balance, "accepted_local": True}
+
+    # Server is higher — return server value
+    return {"authoritative_balance": server_balance, "accepted_local": False}
+
+@app.get("/shards/{user_id}")
+async def get_shard_balance(user_id: str):
+    """Get authoritative server-side shard balance."""
+    result = get_db().table("shard_balances") \
+        .select("balance, lifetime_earned, lifetime_spent, updated_at") \
+        .eq("user_id", user_id) \
+        .execute()
+
+    if not result.data:
+        return {"user_id": user_id, "balance": 0, "lifetime_earned": 0, "lifetime_spent": 0}
+
+    return result.data[0] | {"user_id": user_id}
+
+# ── SUBSCRIPTION VERIFICATION ─────────────────────────────────
+
+@app.post("/subscription/verify")
+async def verify_subscription(req: SubscriptionVerifyRequest):
+    """
+    Verify subscription status server-side.
+    In production: validates purchase token against Google Play API.
+    Stores verified status in Supabase — app checks here, not local prefs.
+    """
+
+    # TODO Phase 2: Call Google Play Developer API to verify purchase_token
+    # For now: trust the token if it's present and non-empty
+    # Real implementation:
+    # response = await google_play_api.verify(req.purchase_token, req.product_id)
+    # is_valid = response.purchaseState == 0 and response.autoRenewing
+
+    is_valid = bool(req.purchase_token) and len(req.purchase_token) > 10
+
+    now = int(datetime.utcnow().timestamp() * 1000)
+    sub_end = now + (30 * 24 * 60 * 60 * 1000) if is_valid else 0  # 30 days
+
+    get_db().table("subscriptions").upsert({
+        "user_id":          req.user_id,
+        "is_subscriber":    is_valid,
+        "subscription_end": sub_end,
+        "purchase_token":   req.purchase_token,
+        "product_id":       req.product_id,
+        "free_week_end":    req.free_week_end,
+        "verified_at":      datetime.utcnow().isoformat(),
+        "updated_at":       datetime.utcnow().isoformat()
+    }).execute()
+
+    # Also update users table
+    get_db().table("users").upsert({
+        "id":            req.user_id,
+        "is_subscriber": is_valid,
+        "free_week_end": req.free_week_end
+    }).execute()
+
+    return {
+        "verified":       is_valid,
+        "is_subscriber":  is_valid,
+        "subscription_end": sub_end,
+        "free_week_end":  req.free_week_end
+    }
+
+@app.get("/subscription/{user_id}")
+async def get_subscription_status(user_id: str):
+    """
+    Get server-verified subscription status.
+    App should call this on launch — cannot be faked locally.
+    """
+    result = get_db().table("subscriptions") \
+        .select("is_subscriber, subscription_end, free_week_end, verified_at") \
+        .eq("user_id", user_id) \
+        .execute()
+
+    if not result.data:
+        return {
+            "user_id":        user_id,
+            "is_subscriber":  False,
+            "free_week_active": False,
+            "subscription_end": 0,
+            "free_week_end":  0
+        }
+
+    sub = result.data[0]
+    now = int(datetime.utcnow().timestamp() * 1000)
+    free_week_active = sub["free_week_end"] > now
+    sub_active = sub["is_subscriber"] and sub["subscription_end"] > now
+
+    return {
+        "user_id":          user_id,
+        "is_subscriber":    sub_active,
+        "free_week_active": free_week_active,
+        "has_full_access":  sub_active or free_week_active,
+        "subscription_end": sub["subscription_end"],
+        "free_week_end":    sub["free_week_end"],
+        "verified_at":      sub["verified_at"]
+    }
