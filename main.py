@@ -39,9 +39,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
-PORT         = int(os.environ.get("PORT", "8000"))
+SUPABASE_URL         = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY         = os.environ.get("SUPABASE_KEY", "")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+PORT                 = int(os.environ.get("PORT", "8000"))
 
 # Lazy init — connect on first request not on startup
 _supabase_client: Optional[Client] = None
@@ -49,7 +50,9 @@ _supabase_client: Optional[Client] = None
 def get_db() -> Client:
     global _supabase_client
     if _supabase_client is None:
-        _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        # Use service key to bypass RLS on server side
+        key = SUPABASE_SERVICE_KEY if SUPABASE_SERVICE_KEY else SUPABASE_KEY
+        _supabase_client = create_client(SUPABASE_URL, key)
     return _supabase_client
 
 # Creator earnings rate — 1% of shards spent
